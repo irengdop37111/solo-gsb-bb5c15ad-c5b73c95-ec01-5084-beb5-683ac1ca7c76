@@ -1,0 +1,23 @@
+services:
+  redact:
+    build: .
+    image: json-redact:latest
+    ports:
+      - "8080:8080"
+    environment:
+      # Override in a .env file or your shell for a real deployment.
+      REDACT_SALT: "${REDACT_SALT:-}"
+      # SQLite file holding the versioned policy library (inside the volume).
+      POLICY_DB: "/data/policies.db"
+    volumes:
+      # Named volume: policy versions survive container rebuilds/restarts.
+      - policy-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health').status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  policy-data:
