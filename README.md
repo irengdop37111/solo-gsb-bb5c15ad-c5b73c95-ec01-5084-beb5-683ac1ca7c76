@@ -17,6 +17,7 @@ docker compose up --build
 服务在 <http://localhost:8080> 就绪：
 
 - `POST /redact` — 脱敏接口（内联规则或引用策略，二选一）
+- `POST /redact/ndjson` — NDJSON 流式脱敏（`application/x-ndjson`，查询参数指定已有策略）
 - `PUT  /policies/{name}` — 创建/更新策略（ETag 乐观并发控制）
 - `GET  /policies/{name}` — 查询策略最新版本
 - `GET  /policies/{name}/versions/{version}` — 查询不可变历史快照
@@ -276,6 +277,85 @@ curl -s -X POST http://localhost:8080/policies/pii/impact \
     时此处展示原子解析出的版本号）；内联规则时该字段缺省。
 - 顶层 `policy`：与审计中的含义相同；内联请求为 `null`。
 
+## NDJSON 流式脱敏：`POST /redact/ndjson`
+
+面向大文件的逐行脱敏接口。请求与响应均为 `application/x-ndjson`（每行一个 JSON
+文档），策略通过查询参数指定**已存在**的策略：
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| `name` | 是 | 策略名（`PUT /policies/{name}` 创建）；不存在返回 `404` |
+| `version` | 否 | 锁定不可变历史版本；省略则使用当前最新版本 |
+
+服务在**读取任何请求字节之前固定一次**策略版本，整个流（无论多长）都基于同一不可变
+快照处理，即使传输途中有并发 `PUT` 也不会出现前后行版本不一致。实际生效的版本通过
+响应头返回：
+
+- `Policy-Name`：策略名；
+- `Policy-Version`：固定下来的具体版本号；
+- `ETag`：该版本的 ETag（与 `GET /policies/{name}` 返回的一致）。
+
+策略（或指定版本）不存在 -> `404`；`Content-Type` 不是 `application/x-ndjson`
+（允许携带 `; charset=...` 等参数）-> `415`。
+
+### 行号与响应记录
+
+响应同样是 NDJSON，**每个非空物理行**输出一条记录；空白行（去掉行尾后为零字节）
+跳过不输出，但**仍占用行号**。每条成功记录为：
+
+```json
+{"line":3,"redacted":{"email":"***REDACTED***"},"audit":[...]}
+```
+
+- `line`：**物理行号**（从 1 开始，按请求字节计数，不是成功记录的序号）；
+- `redacted` / `audit`：与 `POST /redact` 完全相同的脱敏结果与审计轨迹；审计中每条
+  记录都带 `policy`，标明流开始时固定的策略名与版本。
+
+错误行**不会中断**后续行处理，只返回行号与一个错误码，不含其他字段：
+
+| 错误码 | 触发条件 |
+| --- | --- |
+| `invalid_json` | 该行不是合法 JSON（注意：仅含空白字符的行也算非空行，报 `invalid_json`） |
+| `invalid_utf8` | 该行不是合法 UTF-8（UTF-8 校验先于 JSON 解析） |
+| `line_too_long` | 原始行字节超过 1 MiB（不含行尾） |
+
+### 行尾兼容与内存上限
+
+- 同时兼容 LF、CRLF；**无换行结尾的最后一行**也会正常处理；
+- 逐块读取、逐行解析，内存占用只与**当前读取块 + 最长一行**有关，**不随文件总大小
+  增长**（可直接喂入 GB 级文件）；
+- 单行原始字节上限 **1 MiB（1048576 字节，不含行尾）**：超限行的内容直接丢弃到下一
+  个换行，且整行**只报一次** `line_too_long`，随后从下一物理行继续；
+- 恰好 1 MiB（CRLF 时按去掉 CR 后的长度计）为合法，1 MiB + 1 字节起超限。
+
+请求示例：
+
+```bash
+curl -s -X POST 'http://localhost:8080/redact/ndjson?name=pii-basic' \
+  -H 'Content-Type: application/x-ndjson' \
+  --data-binary @records.ndjson -D headers.txt
+# headers.txt 中可见 Policy-Name / Policy-Version / ETag
+```
+
+输入：
+
+```ndjson
+{"email":"a@x.io","password":"p"}
+
+{"email":"b@x.io"}
+oops-not-json
+{"email":"c@x.io"}
+```
+
+输出（第 2 行为空白行，跳过但占行号；第 4 行为坏 JSON）：
+
+```ndjson
+{"line":1,"redacted":{"email":"***REDACTED***"},"audit":[{...,"policy":{"name":"pii-basic","version":2}}]}
+{"line":3,"redacted":{"email":"***REDACTED***"},"audit":[...]}
+{"line":4,"error":"invalid_json"}
+{"line":5,"redacted":{"email":"***REDACTED***"},"audit":[...]}
+```
+
 ## 端到端示例
 
 ```bash
@@ -329,8 +409,9 @@ python -m pytest -q
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 应用：/redact、/policies、/impact 路由
+│   ├── main.py          # FastAPI 应用：/redact、/redact/ndjson、/policies、/impact 路由
 │   ├── redaction.py     # 核心引擎：pointer 解析、通配匹配、冲突裁决、动作执行
+│   ├── ndjson.py        # NDJSON 分块行解析（限内存、1MiB/行、LF/CRLF）与流式响应
 │   ├── impact.py        # 影响预览：两次审计对比 added/removed/changed
 │   ├── policy_store.py  # SQLite 版本化策略库：ETag 乐观锁、不可变版本、原子读取
 │   ├── schemas.py       # 请求/响应 Pydantic 模型
@@ -338,6 +419,8 @@ python -m pytest -q
 ├── tests/
 │   ├── conftest.py      # 每测例一个临时 SQLite 库
 │   ├── test_engine.py   # 引擎单元测试（通配、优先级、数组稳定性、根节点等）
+│   ├── test_ndjson_parser.py  # NDJSON 分块切分：行号、CRLF、1MiB 限制与再同步
+│   ├── test_ndjson_api.py     # /redact/ndjson HTTP 集成测试
 │   ├── test_impact.py   # 影响预览测试（短路、下标稳定、逐样本差异、404/422）
 │   ├── test_api.py      # /redact HTTP 层集成测试
 │   └── test_policies.py # 策略库测试：ETag 生命周期、并发更新、历史复现

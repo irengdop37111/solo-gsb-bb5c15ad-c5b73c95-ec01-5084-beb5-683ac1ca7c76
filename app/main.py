@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import os
+import json
 from contextlib import asynccontextmanager
 from typing import Annotated, Any, Dict, Optional
 
-from fastapi import FastAPI, Header, HTTPException, Path, status
+from fastapi import FastAPI, Header, HTTPException, Path, Query, Request, status
 from fastapi.responses import JSONResponse
 
 from . import config, policy_store
 from . import impact as impact_preview
+from . import ndjson
 from .redaction import redact
 from .schemas import (
     NAME_PATTERN,
@@ -304,4 +306,115 @@ def redact_endpoint(request: RedactRequest) -> JSONResponse:
 
     return JSONResponse(
         {"redacted": redacted, "audit": audit, "policy": policy_ref}
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Streaming NDJSON redaction
+# --------------------------------------------------------------------------- #
+
+
+def _ndjson_record(event: ndjson.LineEvent, rules, salt: str, policy_ref) -> bytes:
+    """Build one NDJSON response record for a single physical input line."""
+    # Blank lines (zero content bytes after removing LF/CRLF) are skipped
+    # entirely -- but the splitter already advanced the physical line
+    # counter, so surrounding lines keep their true numbers.
+    if event.error is not None:
+        return ndjson.encode_line({"line": event.line_no, "error": event.error})
+
+    raw = event.raw
+    if not raw:
+        return b""
+
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return ndjson.encode_line({"line": event.line_no, "error": ndjson.INVALID_UTF8})
+
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return ndjson.encode_line({"line": event.line_no, "error": ndjson.INVALID_JSON})
+
+    redacted, audit = redact(data, rules, salt=salt)
+    # Stamp every audit record with the concrete policy applied to the stream.
+    for entry in audit:
+        entry["policy"] = policy_ref
+    return ndjson.encode_line({"line": event.line_no, "redacted": redacted, "audit": audit})
+
+
+@app.post(
+    "/redact/ndjson",
+    tags=["redact"],
+    summary="Redact an application/x-ndjson stream line by line.",
+    responses={
+        200: {"content": {ndjson.NDJSON_MEDIA_TYPE: {}}, "description": "NDJSON stream; one record per non-empty physical input line."},
+        404: {"description": "Referenced policy or pinned version does not exist."},
+        415: {"description": "Content-Type must be application/x-ndjson."},
+    },
+)
+async def redact_ndjson_endpoint(
+    request: Request,
+    name: Annotated[
+        str,
+        Query(description="Name of an existing policy (created via PUT /policies/{name})."),
+    ],
+    version: Annotated[
+        Optional[int],
+        Query(ge=1, description="Optional immutable policy version; defaults to the latest."),
+    ] = None,
+):
+    # Fix the policy version ONCE, before any request bytes are read, so the
+    # whole stream -- including its response headers -- is processed against
+    # one immutable snapshot even if a concurrent PUT lands mid-stream.
+    try:
+        if version is None:
+            snapshot = policy_store.get_current(name)
+        else:
+            snapshot = policy_store.get_version(name, version)
+    except policy_store.PolicyNotFound:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "policy_not_found", "name": name, "version": version},
+        )
+
+    declared = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if declared != ndjson.NDJSON_MEDIA_TYPE:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail={
+                "error": "unsupported_media_type",
+                "expected": ndjson.NDJSON_MEDIA_TYPE,
+            },
+        )
+
+    rule_specs = [RuleSpec.model_validate(item) for item in snapshot["rules"]]
+    rules = compile_specs(rule_specs)
+    salt = config.get_salt()
+    policy_ref = {"name": snapshot["name"], "version": snapshot["version"]}
+
+    async def generate():
+        # Bounded-memory parsing: memory depends on the largest line (capped at
+        # 1 MiB) and the current read chunk, never on the total stream size.
+        async for event in ndjson.iter_ndjson_lines(request.stream()):
+            try:
+                record = _ndjson_record(event, rules, salt, policy_ref)
+            except Exception:
+                # A pathological single line must never tear down the stream;
+                # report it as bad input and continue with the next line.
+                record = ndjson.encode_line(
+                    {"line": event.line_no, "error": ndjson.INVALID_JSON}
+                )
+            if record:
+                yield record
+
+    return ndjson.NdjsonStreamingResponse(
+        generate(),
+        media_type=ndjson.NDJSON_MEDIA_TYPE,
+        headers={
+            # Echo the concrete snapshot fixed before reading the body.
+            "Policy-Name": snapshot["name"],
+            "Policy-Version": str(snapshot["version"]),
+            "ETag": snapshot["etag"],
+        },
     )
