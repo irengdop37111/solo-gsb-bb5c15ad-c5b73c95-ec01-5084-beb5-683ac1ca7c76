@@ -17,6 +17,7 @@ docker compose up --build
 服务在 <http://localhost:8080> 就绪：
 
 - `POST /redact` — 脱敏接口（内联规则或引用策略，二选一）
+- `POST /redact/ndjson` — 流式 NDJSON 批量脱敏（`application/x-ndjson`，按查询参数 `name` 引用已存策略）
 - `PUT  /policies/{name}` — 创建/更新策略（ETag 乐观并发控制）
 - `GET  /policies/{name}` — 查询策略最新版本
 - `GET  /policies/{name}/versions/{version}` — 查询不可变历史快照
@@ -305,6 +306,45 @@ curl -s -X POST http://localhost:8080/redact \
   -d '{"data":{"users":[{"email":"a@x.io","password":"p"}]},"policy":{"name":"pii","version":1}}'
 ```
 
+## NDJSON 流式脱敏：`POST /redact/ndjson`
+
+对大批量记录可直接上传 [NDJSON](https://github.com/ndjson/ndjson-spec)（每行一个 JSON
+文档），逐行复用 `/redact` 的脱敏语义，响应同样是 NDJSON（每行对应一个输入行）。
+
+- **请求**：`Content-Type: application/x-ndjson`；查询参数 `name` 指定**已存在**的策略，
+  `version` 可选（语义同 `/redact`：省略则取当前最新版本，指定则锁定历史版本）。
+  - 策略/版本不存在 → `404`；`Content-Type` 不符 → `415`；参数非法 → `422`。
+- **策略版本在读文件前固定一次**：开始读取请求体之前只解析一次策略，并通过响应头
+  `X-Policy-Version`（及 `X-Policy-Name`）返回该具体版本；传输过程中策略被更新也不会
+  影响本次响应。
+- **物理行号**：从 1 开始；每个非空行输出一行结果，空白行直接跳过但**仍占行号**，因此
+  错误行号与输入文件的物理行号一致。兼容 LF、CRLF，以及**没有结尾换行**的最后一行。
+- **分块解析、内存恒定**：按 chunk 流式读取，任何时刻只缓存当前行，内存占用不随文件总
+  大小增长（与最大单行同量级）。
+- **单行上限 1 MiB**（不含行尾）：超限的行被丢弃直到下一个换行，且**只报一次**
+  `line_too_long`，随后继续正常处理。
+- **坏行不阻断后续行**：非法 UTF-8、坏 JSON（含嵌套过深无法安全解析的行）只返回
+  `{"line": <行号>, "error": "invalid_utf8" | "invalid_json"}`，其余行照常处理。
+
+正常行的响应结构为 `{"line", "redacted", "audit"}`，`audit` 与 `/redact` 完全一致
+（含 `policy` 戳记）；错误行只有 `line` 与 `error`。
+
+```bash
+# 上传（文件无需以换行结尾；可含空行/CRLF）
+curl -s -X POST 'http://localhost:8080/redact/ndjson?name=pii' \
+  -H 'Content-Type: application/x-ndjson' \
+  --data-binary @records.ndjson -D -
+# HTTP/1.1 200 OK
+# content-type: application/x-ndjson
+# x-policy-name: pii
+# x-policy-version: 2
+# {"line":1,"redacted":{"email":"***REDACTED***"},"audit":[...]}
+# {"line":2,"error":"invalid_json"}
+# {"line":3,"error":"line_too_long"}
+```
+
+锁定历史版本：`/redact/ndjson?name=pii&version=1`。
+
 ## 配置
 
 | 环境变量 | 默认值 | 说明 |
@@ -329,8 +369,9 @@ python -m pytest -q
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 应用：/redact、/policies、/impact 路由
+│   ├── main.py          # FastAPI 应用：/redact、/redact/ndjson、/policies、/impact 路由
 │   ├── redaction.py     # 核心引擎：pointer 解析、通配匹配、冲突裁决、动作执行
+│   ├── ndjson.py        # NDJSON 分块行解析：物理行号、LF/CRLF、1MiB 限长丢弃
 │   ├── impact.py        # 影响预览：两次审计对比 added/removed/changed
 │   ├── policy_store.py  # SQLite 版本化策略库：ETag 乐观锁、不可变版本、原子读取
 │   ├── schemas.py       # 请求/响应 Pydantic 模型
@@ -338,6 +379,7 @@ python -m pytest -q
 ├── tests/
 │   ├── conftest.py      # 每测例一个临时 SQLite 库
 │   ├── test_engine.py   # 引擎单元测试（通配、优先级、数组稳定性、根节点等）
+│   ├── test_ndjson.py   # NDJSON 行解析与流式接口测试（CRLF、空行、限长、坏行、内存上限）
 │   ├── test_impact.py   # 影响预览测试（短路、下标稳定、逐样本差异、404/422）
 │   ├── test_api.py      # /redact HTTP 层集成测试
 │   └── test_policies.py # 策略库测试：ETag 生命周期、并发更新、历史复现
